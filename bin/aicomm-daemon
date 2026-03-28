@@ -212,31 +212,7 @@ def handle_message(msg_path: Path, project_dir: Path) -> None:
     resp_file.write_text(f"{header}\n{response}\n{footer}\n")
 
     if from_pane:
-        # Look up sender's tool to choose delivery method
-        from_tool = ""
-        if frm and frm != "shell":
-            sender_entry = registry.get(frm)
-            if sender_entry:
-                from_tool = sender_entry.get("tool", "")
-
-        if from_tool == "claude":
-            # Claude sender: use tmux popup so response appears as an overlay
-            # without being injected into Claude's input box (avoids tool use)
-            popup_cmd = (
-                f"printf '\\n' && "
-                f"cat {shlex.quote(str(resp_file))} && "
-                f"printf '\\n  Press Enter to dismiss...\\n' && read"
-            )
-            subprocess.run(
-                ["tmux", "display-popup", "-E",
-                 "-w", "80%", "-h", "60%",
-                 "-T", f" Response from {to} ",
-                 "-t", from_pane,
-                 popup_cmd],
-                check=False
-            )
-        else:
-            tmux_send(from_pane, f"cat {shlex.quote(str(resp_file))}")
+        tmux_send(from_pane, f"cat {shlex.quote(str(resp_file))}")
     else:
         print(f"[daemon] Response saved to {resp_file}", flush=True)
 
