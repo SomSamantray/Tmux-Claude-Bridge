@@ -175,11 +175,12 @@ def handle_message(msg_path: Path, project_dir: Path) -> None:
     if tool == "claude":
         # Claude Code receives text directly; instruct it to end with marker
         injected_cmd = (
-            f"📨 Message from {frm}: {message}\n"
-            f"(Please end your reply with exactly: {END_MARKER})"
+            f"📨 AICOMM message from {frm}: {message}\n"
+            f"Reply in plain text only. Do not use any tools or read any files. "
+            f"End your reply with exactly: {END_MARKER}"
         )
         tmux_send(target_pane, injected_cmd)
-        short_cmd = f"📨 Message from {frm}"
+        short_cmd = f"📨 AICOMM message from {frm}"
     else:
         # Gemini / Codex: run through wrapper script
         wrapper = f"my{tool}"
