@@ -10,5 +10,5 @@ if ! command -v gemini &>/dev/null; then
   exit 1
 fi
 
-gemini "$@" 2>/tmp/aicomm-gemini-stderr.log || true
+gemini --prompt "$@" 2>/tmp/aicomm-gemini-stderr.log || true
 printf '\n###AICOMM_END###\n'
