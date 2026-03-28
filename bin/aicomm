@@ -251,12 +251,6 @@ cmd_start() {
   obj=$(printf '{"tmux":"%s","tool":"%s","role":"%s","registered_at":"%s"}' \
     "$pane_target" "$tool" "$tool" "$(timestamp)")
   registry_set "$alias" "$obj"
-  # Launch the tool inside the new window
-  case "$tool" in
-    gemini) tmux send-keys -t "$pane_target" 'gemini' Enter ;;
-    codex)  tmux send-keys -t "$pane_target" 'codex'  Enter ;;
-    # claude: user opens Claude Code themselves — no auto-launch
-  esac
   ok "Started window '$alias' → $pane_target (tool: $tool)"
 }
 
