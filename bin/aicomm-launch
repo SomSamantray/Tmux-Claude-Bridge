@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# aicomm-launch — One command to set up side-by-side Claude + Gemini session
+# Usage: aicomm-launch [project-dir]
+set -euo pipefail
+
+PROJECT_DIR="${1:-$(pwd)}"
+SESSION="aicomm"
+
+# Kill old session if it exists
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+# Init aicomm in the project dir
+cd "$PROJECT_DIR"
+mkdir -p .aicomm/queue .aicomm/responses
+[[ -f .aicomm/registry.json ]] || echo '{}' > .aicomm/registry.json
+
+# Create new session, start Claude on the left pane
+tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
+tmux send-keys -t "$SESSION:0" "cd $PROJECT_DIR && claude" Enter
+
+# Split vertically — Gemini shell on the right (50% width)
+tmux split-window -t "$SESSION:0" -h
+tmux send-keys -t "$SESSION:0.1" "cd $PROJECT_DIR" Enter
+
+# Register the right pane as gemini-ui
+sleep 1
+"$(dirname "$(realpath "$0")")/aicomm" register gemini-ui \
+    --tmux "${SESSION}:0.1" \
+    --tool gemini 2>/dev/null || true
+
+# Add a clear label to the right pane
+tmux send-keys -t "$SESSION:0.1" "echo ''" Enter
+tmux send-keys -t "$SESSION:0.1" "printf '\\033[36m━━━ GEMINI-UI WINDOW ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m'" Enter
+tmux send-keys -t "$SESSION:0.1" "echo ''" Enter
+tmux send-keys -t "$SESSION:0.1" "printf '  Waiting for messages from Claude...\\n  (This pane runs mygemini automatically)\\n'" Enter
+tmux send-keys -t "$SESSION:0.1" "echo ''" Enter
+
+# Focus back on Claude pane
+tmux select-pane -t "$SESSION:0.0"
+
+# Attach
+printf '\033[32m✔\033[0m  Launching AICOMM — Claude (left) + Gemini (right)\n'
+printf '\033[36mℹ\033[0m  In Claude: type /send gemini-ui "your message"\n\n'
+
+exec tmux attach-session -t "$SESSION"
