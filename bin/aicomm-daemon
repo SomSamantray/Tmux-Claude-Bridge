@@ -199,6 +199,12 @@ def handle_message(msg_path: Path, project_dir: Path) -> None:
 
     print(f"[daemon] Response received for {msg_id} ({len(response)} chars)", flush=True)
 
+    # Strip known noise lines (e.g. Gemini MCP warnings)
+    NOISE_PATTERNS = ["MCP issues detected", "Run /mcp list"]
+    response_lines = [l for l in response.splitlines()
+                      if not any(p in l for p in NOISE_PATTERNS)]
+    response = "\n".join(response_lines).strip()
+
     # Update context
     append_context(project_dir, frm, to, message, response)
 

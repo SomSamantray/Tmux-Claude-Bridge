@@ -239,19 +239,37 @@ cmd_start() {
     err "tmux not found. Install with: brew install tmux"
     exit 1
   fi
-  # Create new tmux window
-  local session
-  session=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "aicomm")
-  tmux new-window -t "$session" -n "$alias"
-  local win_idx
-  win_idx=$(tmux list-windows -t "$session" -F "#{window_index} #{window_name}" \
-    | awk -v name="$alias" '$2 == name { print $1; exit }')
-  local pane_target="${session}:${win_idx}.0"
+
+  local pane_target=""
+
+  if [[ -n "$TMUX" ]]; then
+    # Inside tmux — split current window horizontally so user sees both panes
+    tmux split-window -h
+    pane_target=$(tmux display-message -p "#{session_name}:#{window_index}.#{pane_index}")
+  else
+    # Not in tmux — create a new session and use its first window
+    local session="aicomm"
+    tmux new-session -d -s "$session" 2>/dev/null || true
+    tmux new-window -t "$session" -n "$alias" 2>/dev/null || true
+    local win_idx
+    win_idx=$(tmux list-windows -t "$session" -F "#{window_index} #{window_name}" \
+      | awk -v name="$alias" '$2 == name { print $1; exit }')
+    pane_target="${session}:${win_idx}.0"
+    warn "Not in tmux. Session created but you need to run 'tmux attach -t $session' to see it."
+  fi
+
+  # Launch claude in the new pane (gemini/codex use mygemini/mycodex wrappers per message)
+  local project_dir
+  project_dir="$(pwd)"
+  if [[ "$tool" == "claude" ]]; then
+    tmux send-keys -t "$pane_target" "cd $(printf '%q' "$project_dir") && claude" Enter
+  fi
+
   local obj
   obj=$(printf '{"tmux":"%s","tool":"%s","role":"%s","registered_at":"%s"}' \
     "$pane_target" "$tool" "$tool" "$(timestamp)")
   registry_set "$alias" "$obj"
-  ok "Started window '$alias' → $pane_target (tool: $tool)"
+  ok "Started '$alias' → $pane_target (tool: $tool)"
 }
 
 cmd_stop() {

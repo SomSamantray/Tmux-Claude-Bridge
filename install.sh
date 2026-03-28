@@ -53,13 +53,33 @@ fi
 # Also export for this process so subsequent steps can find the bins
 export PATH="$BIN_DIR:$PATH"
 
-# ─── 4. Install /send slash command ──────────────────────────────────────────
+# ─── 4. Auto-tmux wrapper for claude ─────────────────────────────────────────
+
+CLAUDE_WRAPPER='
+# AICOMM: auto-wrap claude in tmux so /send always works
+claude() {
+  if [ -z "$TMUX" ]; then
+    local _session="claude-$(basename "$(pwd)")"
+    exec tmux new-session -A -s "$_session" "command claude $*"
+  else
+    command claude "$@"
+  fi
+}'
+
+for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+  if [[ -f "$rc" ]] && ! grep -q 'AICOMM: auto-wrap claude' "$rc"; then
+    printf '\n%s\n' "$CLAUDE_WRAPPER" >> "$rc"
+    ok "Added auto-tmux claude wrapper to $rc"
+  fi
+done
+
+# ─── 5. Install /send slash command ──────────────────────────────────────────
 
 mkdir -p "$CLAUDE_COMMANDS_DIR"
 cp "$PLUGIN_DIR/commands/send.md" "$CLAUDE_COMMANDS_DIR/send.md"
 ok "/send command installed to $CLAUDE_COMMANDS_DIR/"
 
-# ─── 5. Register plugin in Claude Code settings ──────────────────────────────
+# ─── 6. Register plugin in Claude Code settings ──────────────────────────────
 
 mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
 
@@ -87,7 +107,7 @@ with open(settings_path, "w") as f:
 print("  \033[32m  ✔\033[0m  Plugin enabled in Claude Code settings")
 PYEOF
 
-# ─── 6. Dep checks ────────────────────────────────────────────────────────────
+# ─── 7. Dep checks ────────────────────────────────────────────────────────────
 
 echo ""
 info "Checking dependencies..."
