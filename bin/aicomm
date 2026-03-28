@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# aicomm — AI Terminal Communication CLI
+# Routes messages between Claude, Gemini, and Codex tmux sessions.
+set -euo pipefail
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+AICOMM_DIR=".aicomm"
+REGISTRY="$AICOMM_DIR/registry.json"
+DAEMON_PID="$AICOMM_DIR/daemon.pid"
+DAEMON_LOG="$AICOMM_DIR/daemon.log"
+QUEUE_DIR="$AICOMM_DIR/queue"
+RESPONSE_DIR="$AICOMM_DIR/responses"
+CONTEXT_FILE="CONTEXT.md"
+DAEMON_SCRIPT="${AICOMM_DAEMON_BIN:-$(dirname "$(realpath "$0")")/aicomm-daemon}"
+END_MARKER="###AICOMM_END###"
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+# Print to stderr in colour
+err()  { printf '\033[31mERROR:\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33m⚠\033[0m  %s\n' "$*" >&2; }
+info() { printf '\033[36mℹ\033[0m  %s\n' "$*"; }
+ok()   { printf '\033[32m✔\033[0m  %s\n' "$*"; }
+
+# Ensure .aicomm/ scaffold exists in CWD
+aicomm_init() {
+  if [[ ! -d "$AICOMM_DIR" ]]; then
+    mkdir -p "$QUEUE_DIR" "$RESPONSE_DIR"
+    echo '{}' > "$REGISTRY"
+    if [[ ! -f "$CONTEXT_FILE" ]]; then
+      cat > "$CONTEXT_FILE" <<'EOF'
+# AICOMM Shared Project Context
+
+This file is automatically maintained by AICOMM.
+Each exchange between AI sessions is appended here.
+
+---
+EOF
+    fi
+    ok "Initialised .aicomm/ in $(pwd)"
+  fi
+}
+
+# Read registry (outputs raw JSON)
+registry_get() {
+  cat "$REGISTRY"
+}
+
+# Write a key into registry: registry_set <alias> <json-object>
+registry_set() {
+  local alias="$1"
+  local obj="$2"
+  local tmp
+  tmp=$(mktemp)
+  python3 -c "
+import json, sys
+with open('$REGISTRY') as f:
+    reg = json.load(f)
+reg['$alias'] = json.loads(sys.stdin.read())
+print(json.dumps(reg, indent=2))
+" <<<"$obj" > "$tmp"
+  mv "$tmp" "$REGISTRY"
+}
+
+# Remove a key from registry
+registry_del() {
+  local alias="$1"
+  local tmp
+  tmp=$(mktemp)
+  python3 -c "
+import json
+with open('$REGISTRY') as f:
+    reg = json.load(f)
+reg.pop('$alias', None)
+print(json.dumps(reg, indent=2))
+" > "$tmp"
+  mv "$tmp" "$REGISTRY"
+}
+
+# Look up alias in registry; prints JSON object or empty string
+registry_lookup() {
+  local alias="$1"
+  python3 -c "
+import json
+with open('$REGISTRY') as f:
+    reg = json.load(f)
+entry = reg.get('$alias', None)
+if entry:
+    print(json.dumps(entry))
+" 2>/dev/null || true
+}
+
+# Infer tool name from alias prefix (gemini-*, codex-*, claude-*)
+infer_tool() {
+  local alias="$1"
+  case "$alias" in
+    gemini*) echo "gemini" ;;
+    codex*)  echo "codex"  ;;
+    claude*) echo "claude" ;;
+    *)       echo ""       ;;
+  esac
+}
+
+# Scan tmux for a window matching alias; prints "session:index.0" or empty
+tmux_find_window() {
+  local alias="$1"
+  if ! command -v tmux &>/dev/null; then return; fi
+  tmux list-windows -a -F "#{session_name}:#{window_index}.0 #{window_name}" 2>/dev/null \
+    | awk -v name="$alias" '$2 == name { print $1; exit }'
+}
+
+# Generate a UUID (macOS compatible)
+new_uuid() {
+  python3 -c "import uuid; print(str(uuid.uuid4()))"
+}
+
+# Timestamp ISO8601
+timestamp() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# ─── Daemon management ────────────────────────────────────────────────────────
+
+daemon_running() {
+  if [[ ! -f "$DAEMON_PID" ]]; then return 1; fi
+  local pid
+  pid=$(cat "$DAEMON_PID")
+  kill -0 "$pid" 2>/dev/null
+}
+
+daemon_start() {
+  if daemon_running; then return; fi
+  if [[ ! -f "$DAEMON_SCRIPT" ]]; then
+    err "Daemon script not found: $DAEMON_SCRIPT"
+    exit 1
+  fi
+  local project_dir
+  project_dir="$(pwd)"
+  nohup python3 "$DAEMON_SCRIPT" "$project_dir" >> "$DAEMON_LOG" 2>&1 &
+  echo $! > "$DAEMON_PID"
+  sleep 0.3  # brief pause so daemon can write its own pidfile check
+  ok "Daemon started (PID $(cat "$DAEMON_PID"))"
+}
+
+# ─── Subcommands ──────────────────────────────────────────────────────────────
+
+cmd_init() {
+  aicomm_init
+}
+
+cmd_register() {
+  aicomm_init
+  local alias="" tmux_target="" tool="" role=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tmux)  tmux_target="$2"; shift 2 ;;
+      --tool)  tool="$2";        shift 2 ;;
+      --role)  role="$2";        shift 2 ;;
+      *)       alias="$1";       shift   ;;
+    esac
+  done
+  if [[ -z "$alias" || -z "$tmux_target" || -z "$tool" ]]; then
+    err "Usage: aicomm register <alias> --tmux <session:win.pane> --tool <claude|gemini|codex>"
+    exit 1
+  fi
+  [[ -z "$role" ]] && role="$(infer_tool "$alias")"
+  local obj
+  obj=$(printf '{"tmux":"%s","tool":"%s","role":"%s","registered_at":"%s"}' \
+    "$tmux_target" "$tool" "$role" "$(timestamp)")
+  registry_set "$alias" "$obj"
+  ok "Registered '$alias' → $tmux_target (tool: $tool)"
+}
+
+cmd_list() {
+  aicomm_init
+  python3 -c "
+import json
+with open('$REGISTRY') as f:
+    reg = json.load(f)
+if not reg:
+    print('  (no sessions registered)')
+else:
+    fmt = '  {:<20} {:<20} {:<10} {}'
+    print(fmt.format('ALIAS', 'TMUX PANE', 'TOOL', 'ROLE'))
+    print('  ' + '-'*60)
+    for alias, info in sorted(reg.items()):
+        print(fmt.format(alias, info.get('tmux','?'), info.get('tool','?'), info.get('role','?')))
+"
+}
+
+cmd_status() {
+  aicomm_init
+  echo ""
+  echo "  Sessions:"
+  cmd_list
+  echo ""
+  echo "  Daemon:"
+  if daemon_running; then
+    ok "  Running (PID $(cat "$DAEMON_PID"))"
+  else
+    warn "  Not running"
+  fi
+  echo ""
+  local pending
+  pending=$(find "$QUEUE_DIR" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+  echo "  Queue: $pending message(s) pending"
+  echo ""
+}
+
+cmd_start() {
+  aicomm_init
+  local alias="" tool=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tool) tool="$2"; shift 2 ;;
+      *)      alias="$1"; shift  ;;
+    esac
+  done
+  if [[ -z "$alias" ]]; then
+    err "Usage: aicomm start <alias> [--tool <claude|gemini|codex>]"
+    exit 1
+  fi
+  if [[ -z "$tool" ]]; then
+    tool="$(infer_tool "$alias")"
+    if [[ -z "$tool" ]]; then
+      err "Cannot infer tool from alias '$alias'. Pass --tool <claude|gemini|codex>"
+      exit 1
+    fi
+  fi
+  # Check if already registered
+  local existing
+  existing="$(registry_lookup "$alias")"
+  if [[ -n "$existing" ]]; then
+    warn "'$alias' is already registered."
+    return
+  fi
+  # Check tmux available
+  if ! command -v tmux &>/dev/null; then
+    err "tmux not found. Install with: brew install tmux"
+    exit 1
+  fi
+  # Create new tmux window
+  local session
+  session=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "aicomm")
+  tmux new-window -t "$session" -n "$alias"
+  local win_idx
+  win_idx=$(tmux list-windows -t "$session" -F "#{window_index} #{window_name}" \
+    | awk -v name="$alias" '$2 == name { print $1; exit }')
+  local pane_target="${session}:${win_idx}.0"
+  local obj
+  obj=$(printf '{"tmux":"%s","tool":"%s","role":"%s","registered_at":"%s"}' \
+    "$pane_target" "$tool" "$tool" "$(timestamp)")
+  registry_set "$alias" "$obj"
+  # Launch the tool inside the new window
+  case "$tool" in
+    gemini) tmux send-keys -t "$pane_target" 'gemini' Enter ;;
+    codex)  tmux send-keys -t "$pane_target" 'codex'  Enter ;;
+    # claude: user opens Claude Code themselves — no auto-launch
+  esac
+  ok "Started window '$alias' → $pane_target (tool: $tool)"
+}
+
+cmd_stop() {
+  aicomm_init
+  local alias="$1"
+  if [[ -z "$alias" ]]; then
+    err "Usage: aicomm stop <alias>"
+    exit 1
+  fi
+  local entry
+  entry="$(registry_lookup "$alias")"
+  if [[ -z "$entry" ]]; then
+    warn "'$alias' not found in registry."
+    return
+  fi
+  local pane
+  pane=$(python3 -c "import json,sys; e=json.loads(sys.stdin.read()); print(e['tmux'])" <<<"$entry")
+  # Kill the tmux window
+  tmux kill-window -t "$pane" 2>/dev/null || warn "tmux window for '$alias' already gone"
+  registry_del "$alias"
+  ok "Stopped and deregistered '$alias'"
+}
+
+cmd_send() {
+  aicomm_init
+
+  local alias="$1"
+  shift
+  local message="$*"
+
+  if [[ -z "$alias" || -z "$message" ]]; then
+    err "Usage: aicomm send <alias|all> \"<message>\""
+    exit 1
+  fi
+
+  # Determine sender: try to detect current tmux pane
+  local sender_pane=""
+  sender_pane=$(tmux display-message -p "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null || true)
+  local sender_alias="shell"
+  # Find alias matching our pane in registry
+  if [[ -n "$sender_pane" ]]; then
+    sender_alias=$(python3 -c "
+import json
+with open('$REGISTRY') as f:
+    reg = json.load(f)
+for a, info in reg.items():
+    if info.get('tmux') == '$sender_pane':
+        print(a)
+        break
+" 2>/dev/null || echo "shell")
+  fi
+
+  # Broadcast to all
+  if [[ "$alias" == "all" ]]; then
+    local count=0
+    while IFS= read -r target_alias; do
+      [[ "$target_alias" == "$sender_alias" ]] && continue  # skip self
+      _enqueue_message "$target_alias" "$sender_alias" "$sender_pane" "$message"
+      ((count++)) || true
+    done < <(python3 -c "
+import json
+with open('$REGISTRY') as f:
+    reg = json.load(f)
+for a in reg: print(a)
+" 2>/dev/null)
+    info "Broadcast queued for $count session(s). Response(s) will appear when ready."
+    daemon_start
+    return
+  fi
+
+  # Single target — look up or auto-discover
+  local entry
+  entry="$(registry_lookup "$alias")"
+
+  if [[ -z "$entry" ]]; then
+    # Try tmux auto-discover
+    local found_pane
+    found_pane="$(tmux_find_window "$alias")"
+    if [[ -n "$found_pane" ]]; then
+      local tool
+      tool="$(infer_tool "$alias")"
+      [[ -z "$tool" ]] && tool="gemini"
+      local obj
+      obj=$(printf '{"tmux":"%s","tool":"%s","role":"%s","registered_at":"%s"}' \
+        "$found_pane" "$tool" "$tool" "$(timestamp)")
+      registry_set "$alias" "$obj"
+      entry="$obj"
+      ok "Auto-registered '$alias' → $found_pane"
+    else
+      # Prompt user — detect interactive vs non-interactive (e.g. Claude Code Bash tool)
+      local answer
+      if [[ -t 0 ]]; then
+        printf '\033[33m⚠\033[0m  Session '"'"'%s'"'"' not found. Start it now? [y/n]: ' "$alias"
+        read -r answer
+      else
+        printf '\033[33m⚠\033[0m  Session '"'"'%s'"'"' not found — starting automatically.\n' "$alias"
+        answer="y"
+      fi
+      if [[ "$answer" =~ ^[Yy]$ ]]; then
+        cmd_start "$alias"
+        entry="$(registry_lookup "$alias")"
+      else
+        info "Cancelled. Use 'aicomm start $alias --tool <tool>' to set it up later."
+        exit 0
+      fi
+    fi
+  fi
+
+  _enqueue_message "$alias" "$sender_alias" "$sender_pane" "$message"
+  daemon_start
+  info "⏳ Message sent to '$alias'. Response will appear here when ready."
+}
+
+# Write a message JSON to queue
+_enqueue_message() {
+  local to="$1" from="$2" from_pane="$3" message="$4"
+  local id
+  id="$(new_uuid)"
+  local msg_file="$QUEUE_DIR/${id}.json"
+  # Pass message via stdin to avoid shell-escaping issues with quotes/newlines
+  python3 -c "
+import json, sys
+msg = {
+    'id': '$id',
+    'from': '$from',
+    'from_tmux': '$from_pane',
+    'to': '$to',
+    'message': sys.stdin.read().strip(),
+    'timestamp': '$(timestamp)',
+    'status': 'pending'
+}
+print(json.dumps(msg, indent=2))
+" <<<"$message" > "$msg_file"
+}
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+
+  aicomm — AI Terminal Communication
+
+  USAGE:
+    aicomm init
+    aicomm send <alias|all> "<message>"
+    aicomm start <alias> [--tool <claude|gemini|codex>]
+    aicomm stop <alias>
+    aicomm register <alias> --tmux <session:win.pane> --tool <tool>
+    aicomm list
+    aicomm status
+
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+CMD="$1"; shift
+case "$CMD" in
+  init)     cmd_init ;;
+  send)     cmd_send "$@" ;;
+  start)    cmd_start "$@" ;;
+  stop)     cmd_stop "$@" ;;
+  register) cmd_register "$@" ;;
+  list)     cmd_list ;;
+  status)   cmd_status ;;
+  -h|--help|help) usage ;;
+  *) err "Unknown command: $CMD"; usage; exit 1 ;;
+esac

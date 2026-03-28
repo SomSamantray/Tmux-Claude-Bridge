@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""
+aicomm-daemon — Background message router for AICOMM.
+
+Usage:
+    python3 aicomm-daemon <project_dir>
+
+Watches <project_dir>/.aicomm/queue/ for pending messages,
+injects them into the target tmux pane, monitors for ###AICOMM_END###,
+then routes the response back to the sender pane.
+"""
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+END_MARKER = "###AICOMM_END###"
+POLL_QUEUE_INTERVAL = 0.3   # seconds between queue scans
+POLL_PANE_INTERVAL  = 0.5   # seconds between capture-pane polls
+RESPONSE_TIMEOUT    = 120   # seconds before giving up on a response
+PANE_CAPTURE_LINES  = 200   # lines of pane history to capture
+
+
+# ─── tmux helpers ─────────────────────────────────────────────────────────────
+
+def tmux_send(pane: str, text: str) -> None:
+    """Inject text + Enter into a tmux pane."""
+    try:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", pane, text, "Enter"],
+            check=False
+        )
+    except FileNotFoundError:
+        print("[daemon] tmux not found — cannot inject into pane", flush=True)
+
+
+def tmux_capture(pane: str) -> str:
+    """Return visible pane content (last PANE_CAPTURE_LINES lines)."""
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane, "-S", f"-{PANE_CAPTURE_LINES}"],
+            capture_output=True, text=True, check=False
+        )
+        return result.stdout
+    except FileNotFoundError:
+        return ""
+
+
+def tmux_available() -> bool:
+    return subprocess.run(["which", "tmux"], capture_output=True).returncode == 0
+
+
+# ─── Registry helpers ─────────────────────────────────────────────────────────
+
+def load_registry(registry_path: Path) -> dict:
+    try:
+        return json.loads(registry_path.read_text())
+    except Exception:
+        return {}
+
+
+# ─── CONTEXT.md helpers ───────────────────────────────────────────────────────
+
+def append_context(project_dir: Path, sender: str, target: str, message: str, response: str) -> None:
+    """Append an exchange to CONTEXT.md with a file lock."""
+    context_file = project_dir / "CONTEXT.md"
+    lock_file     = project_dir / ".aicomm" / "context.lock"
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    entry = (
+        f"\n## [{now}] {sender} → {target}\n\n"
+        f"**Task:** {message}\n\n"
+        f"**Response:**\n{response.strip()}\n\n"
+        f"---\n"
+    )
+
+    # Simple file-lock: spin on lock file (max 5s)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            time.sleep(0.1)
+
+    try:
+        with open(context_file, "a") as f:
+            f.write(entry)
+    finally:
+        lock_file.unlink(missing_ok=True)
+
+
+# ─── Response extraction ──────────────────────────────────────────────────────
+
+def extract_response(pane_output: str, injected_cmd: str) -> str:
+    """
+    Find the text between the injected command echo and ###AICOMM_END###.
+    Falls back to everything before the marker if the command line isn't found.
+    """
+    lines = pane_output.splitlines()
+    marker_idx = None
+    cmd_idx    = None
+
+    # Search from the bottom up for the most recent marker and command
+    for i in range(len(lines) - 1, -1, -1):
+        if marker_idx is None and END_MARKER in lines[i]:
+            marker_idx = i
+        if cmd_idx is None and injected_cmd[:30] in lines[i]:
+            cmd_idx = i
+        if marker_idx is not None and cmd_idx is not None:
+            break
+
+    if marker_idx is None:
+        return ""
+
+    start = (cmd_idx + 1) if cmd_idx is not None else 0
+    end   = marker_idx
+
+    response_lines = lines[start:end]
+    return "\n".join(response_lines).strip()
+
+
+# ─── Message handler ──────────────────────────────────────────────────────────
+
+def handle_message(msg_path: Path, project_dir: Path) -> None:
+    """Process a single queued message: inject → watch → route response."""
+    registry_path = project_dir / ".aicomm" / "registry.json"
+
+    try:
+        msg = json.loads(msg_path.read_text())
+    except Exception as e:
+        print(f"[daemon] Failed to read {msg_path}: {e}", flush=True)
+        return
+
+    msg_id   = msg.get("id", "?")
+    to       = msg.get("to", "")
+    frm      = msg.get("from", "shell")
+    from_pane = msg.get("from_tmux", "")
+    message  = msg.get("message", "")
+
+    print(f"[daemon] Handling {msg_id}: {frm} → {to}", flush=True)
+
+    # Mark in_progress
+    msg["status"] = "in_progress"
+    msg_path.write_text(json.dumps(msg, indent=2))
+
+    registry = load_registry(registry_path)
+    target_entry = registry.get(to)
+
+    if not target_entry:
+        _fail(msg, msg_path, from_pane, f"Session '{to}' not found in registry")
+        return
+
+    target_pane = target_entry.get("tmux", "")
+    tool        = target_entry.get("tool", "")
+
+    if not target_pane:
+        _fail(msg, msg_path, from_pane, f"No tmux pane registered for '{to}'")
+        return
+
+    # Snapshot pane BEFORE injection so we can ignore stale markers
+    baseline = tmux_capture(target_pane)
+    # Count how many times END_MARKER already exists in the pane (to skip them)
+    stale_marker_count = baseline.count(END_MARKER)
+
+    # Build the command to inject
+    if tool == "claude":
+        # Claude Code receives text directly; instruct it to end with marker
+        injected_cmd = (
+            f"📨 Message from {frm}: {message}\n"
+            f"(Please end your reply with exactly: {END_MARKER})"
+        )
+        tmux_send(target_pane, injected_cmd)
+        short_cmd = f"📨 Message from {frm}"
+    else:
+        # Gemini / Codex: run through wrapper script
+        wrapper = f"my{tool}"
+        escaped_msg = shlex.quote(message)
+        injected_cmd = f"{wrapper} {escaped_msg}"
+        tmux_send(target_pane, injected_cmd)
+        short_cmd = f"{wrapper} "
+
+    print(f"[daemon] Injected into {target_pane}: {injected_cmd[:60]}", flush=True)
+
+    # Watch for a NEW end marker (ignoring stale ones already in the buffer)
+    response = _watch_for_marker(target_pane, short_cmd, stale_marker_count)
+
+    if response is None:
+        _fail_timeout(msg, msg_path, from_pane, to)
+        return
+
+    print(f"[daemon] Response received for {msg_id} ({len(response)} chars)", flush=True)
+
+    # Update context
+    append_context(project_dir, frm, to, message, response)
+
+    # Write response to a temp file, then inject `cat <file>` into sender pane.
+    # This avoids shell-escaping issues — the response content stays in the file.
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    resp_file = project_dir / ".aicomm" / "responses" / f"{msg_id}.txt"
+    header = f"\n\033[36m--- RESPONSE FROM {to.upper()} [{now}] ---\033[0m"
+    footer = f"\033[36m--- END {to.upper()} RESPONSE ---\033[0m\n"
+    resp_file.write_text(f"{header}\n{response}\n{footer}\n")
+
+    if from_pane:
+        tmux_send(from_pane, f"cat {shlex.quote(str(resp_file))}")
+    else:
+        print(f"[daemon] Response saved to {resp_file}", flush=True)
+
+    msg["status"] = "done"
+    msg_path.write_text(json.dumps(msg, indent=2))
+
+
+def _watch_for_marker(pane: str, short_cmd: str, skip_markers: int = 0):
+    """Poll pane output until END_MARKER appears or timeout."""
+    deadline    = time.time() + RESPONSE_TIMEOUT
+    last_output = ""
+
+    while time.time() < deadline:
+        output = tmux_capture(pane)
+        # Only trigger on markers that appeared AFTER injection
+        if output.count(END_MARKER) > skip_markers:
+            return extract_response(output, short_cmd)
+        last_output = output
+        time.sleep(POLL_PANE_INTERVAL)
+
+    return None
+
+
+def _fail_timeout(msg: dict, msg_path: Path, from_pane: str, to: str) -> None:
+    reason = f"Timeout: '{to}' did not respond within {RESPONSE_TIMEOUT}s"
+    print(f"[daemon] {reason}", flush=True)
+    if from_pane:
+        tmux_send(from_pane, f"printf '\\n⏱ [AICOMM] {reason}\\n'")
+    msg["status"] = "timeout"
+    msg_path.write_text(json.dumps(msg, indent=2))
+
+
+def _fail(msg: dict, msg_path: Path, from_pane: str, reason: str) -> None:
+    print(f"[daemon] FAIL: {reason}", flush=True)
+    if from_pane:
+        safe_reason = reason.replace("'", "\\'")
+        tmux_send(from_pane, f"printf '\\n❌ [AICOMM] Error: {safe_reason}\\n'")
+    msg["status"] = "error"
+    msg["error"]  = reason
+    msg_path.write_text(json.dumps(msg, indent=2))
+
+
+# ─── Main loop ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print("Usage: aicomm-daemon <project_dir>", file=sys.stderr)
+        sys.exit(1)
+
+    project_dir = Path(sys.argv[1]).resolve()
+    queue_dir   = project_dir / ".aicomm" / "queue"
+    pid_file    = project_dir / ".aicomm" / "daemon.pid"
+
+    if not queue_dir.exists():
+        print(f"[daemon] Queue directory not found: {queue_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # Write pidfile
+    pid_file.write_text(str(os.getpid()))
+    print(f"[daemon] Started. PID={os.getpid()} project={project_dir}", flush=True)
+
+    if not tmux_available():
+        print("[daemon] WARNING: tmux not found. Message injection will fail.", flush=True)
+
+    active: set[str] = set()  # message IDs currently being processed
+
+    try:
+        while True:
+            for msg_file in sorted(queue_dir.glob("*.json")):
+                try:
+                    msg = json.loads(msg_file.read_text())
+                except Exception:
+                    continue
+
+                if msg.get("status") == "pending" and msg.get("id") not in active:
+                    msg_id = msg["id"]
+                    active.add(msg_id)
+
+                    def run(path=msg_file, mid=msg_id):
+                        try:
+                            handle_message(path, project_dir)
+                        finally:
+                            active.discard(mid)
+
+                    t = threading.Thread(target=run, daemon=True)
+                    t.start()
+
+            time.sleep(POLL_QUEUE_INTERVAL)
+
+    except KeyboardInterrupt:
+        print("[daemon] Shutting down.", flush=True)
+    finally:
+        pid_file.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()

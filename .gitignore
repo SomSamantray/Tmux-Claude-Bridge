@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V7
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Runtime files (per-project, never committed)
+.aicomm/
+
+# Logs
+*.log
+/tmp/aicomm-*.log

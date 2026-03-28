@@ -1,0 +1,11 @@
+{
+  "name": "aicomm",
+  "description": "Route messages between Claude Code, Gemini CLI, and Codex CLI sessions running in tmux on the same machine. Use /send <alias> <message> to talk to any AI session.",
+  "version": "1.0.0",
+  "author": {
+    "name": "aicomm"
+  },
+  "repository": "https://github.com/SomSamantray/Tmux-Claude-Bridge",
+  "license": "MIT",
+  "keywords": ["tmux", "gemini", "codex", "multi-agent", "routing", "communication"]
+}

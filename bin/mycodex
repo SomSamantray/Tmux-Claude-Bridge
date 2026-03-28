@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# mycodex — Codex CLI wrapper for AICOMM
+# Runs codex with all passed arguments, then emits the end marker
+# so the aicomm daemon knows the response is complete.
+set -euo pipefail
+
+if ! command -v codex &>/dev/null; then
+  echo "ERROR: 'codex' not found in PATH. Install OpenAI Codex CLI first." >&2
+  printf '\n###AICOMM_END###\n'
+  exit 1
+fi
+
+codex "$@" 2>/tmp/aicomm-codex-stderr.log || true
+printf '\n###AICOMM_END###\n'
