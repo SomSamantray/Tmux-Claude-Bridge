@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# aicomm-dual — Two Claude sessions side by side, talking to each other
+# Usage: aicomm-dual [project-dir]
+set -euo pipefail
+
+PROJECT_DIR="${1:-$(pwd)}"
+SESSION="aicomm-dual"
+AICOMM_BIN="$(dirname "$(realpath "$0")")/aicomm"
+
+# Kill old session if exists
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+# Init project
+cd "$PROJECT_DIR"
+mkdir -p .aicomm/queue .aicomm/responses
+[[ -f .aicomm/registry.json ]] || echo '{}' > .aicomm/registry.json
+
+# Create session — first pane (left): Claude session 1
+tmux new-session -d -s "$SESSION" -x "$(tput cols)" -y "$(tput lines)"
+
+# Split into left and right
+tmux split-window -t "$SESSION:0" -h
+
+# Label both panes before launching Claude
+tmux send-keys -t "$SESSION:0.0" "clear && printf '\\033[36m━━━ CLAUDE SESSION 1 (claude-left) ━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m\\n\\n'" Enter
+tmux send-keys -t "$SESSION:0.1" "clear && printf '\\033[35m━━━ CLAUDE SESSION 2 (claude-right) ━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m\\n\\n'" Enter
+
+sleep 1
+
+# Register both panes BEFORE launching Claude (need pane IDs)
+"$AICOMM_BIN" register claude-left  --tmux "${SESSION}:0.0" --tool claude 2>/dev/null || true
+"$AICOMM_BIN" register claude-right --tmux "${SESSION}:0.1" --tool claude 2>/dev/null || true
+
+sleep 0.5
+
+# Launch Claude in both panes
+tmux send-keys -t "$SESSION:0.0" "cd '$PROJECT_DIR' && claude" Enter
+tmux send-keys -t "$SESSION:0.1" "cd '$PROJECT_DIR' && claude" Enter
+
+# Focus left pane
+tmux select-pane -t "$SESSION:0.0"
+
+printf '\033[32m✔\033[0m  Two Claude sessions launched side by side!\n'
+printf '\033[32m✔\033[0m  Left = claude-left   Right = claude-right\n\n'
+printf '\033[36mℹ\033[0m  From LEFT Claude, type:\n'
+printf '     /send claude-right "hello, what are you working on?"\n\n'
+printf '\033[36mℹ\033[0m  From RIGHT Claude, type:\n'
+printf '     /send claude-left "I received your message!"\n\n'
+printf '\033[33m⚠\033[0m  Wait for both Claude sessions to fully load before sending.\n\n'
+
+exec tmux attach-session -t "$SESSION"
